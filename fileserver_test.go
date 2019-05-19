@@ -129,11 +129,11 @@ func testGet(t *testing.T, withGzip bool, expectedBody string) {
 
 func TestOpenStat(t *testing.T) {
 	fh := &fileHandler{http.Dir(".")}
-	_, _, err := fh.openAndStat(".")
+	_, _, err := openAndStat(fh.root, ".")
 	if err == nil {
 		t.Errorf("openAndStat directory succeeded, should have failed")
 	}
-	_, _, err = fh.openAndStat("updog")
+	_, _, err = openAndStat(fh.root, "updog")
 	if err == nil {
 		t.Errorf("openAndStat nonexistent file succeeded, should have failed")
 	}

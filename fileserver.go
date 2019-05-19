@@ -1,12 +1,16 @@
 package gzipped
 
 import (
+	"bytes"
 	"fmt"
+	"io"
+	"io/ioutil"
 	"net/http"
 	"os"
 	"path"
 	"sort"
 	"strings"
+	"sync"
 
 	"github.com/golang/gddo/httputil/header"
 )
@@ -39,6 +43,12 @@ func (e encodingByPreference) Swap(i, j int) { e[i], e[j] = e[j], e[i] }
 // Supported encodings. Higher server preference means the encoding will be when
 // the client doesn't have an explicit preference.
 var supportedEncodings = [...]encoding{
+	// Keep this one first
+	{
+		name:             "",
+		extension:        "",
+		serverPreference: 0,
+	},
 	{
 		name:             "gzip",
 		extension:        ".gz",
@@ -53,6 +63,26 @@ var supportedEncodings = [...]encoding{
 
 type fileHandler struct {
 	root http.FileSystem
+}
+
+type cacheEntry struct {
+	info os.FileInfo
+	data []byte
+}
+
+type cachingFileHandler struct {
+	root  http.FileSystem
+	cache map[string]map[string]*cacheEntry
+	lock  *sync.RWMutex
+}
+
+// FlushCache clears all the cache entries
+func (f *cachingFileHandler) FlushCache() {
+	f.lock.Lock()
+	for _, encoding := range supportedEncodings {
+		f.cache[encoding.name] = make(map[string]*cacheEntry, 50)
+	}
+	f.lock.Unlock()
 }
 
 // FileServer is a drop-in replacement for Go's standard http.FileServer
@@ -75,8 +105,20 @@ func FileServer(root http.FileSystem) http.Handler {
 	return &fileHandler{root}
 }
 
-func (f *fileHandler) openAndStat(path string) (http.File, os.FileInfo, error) {
-	file, err := f.root.Open(path)
+// CachingFileServer is a drop-in replacement for FileServer with in-memory
+// caching
+func CachingFileServer(root http.FileSystem) http.Handler {
+	h := &cachingFileHandler{
+		root:  root,
+		cache: make(map[string]map[string]*cacheEntry, 3),
+		lock:  new(sync.RWMutex),
+	}
+	h.FlushCache()
+	return h
+}
+
+func openAndStat(root http.FileSystem, path string) (http.File, os.FileInfo, error) {
+	file, err := root.Open(path)
 	var info os.FileInfo
 	// This slightly weird variable reuse is so we can get 100% test coverage
 	// without having to come up with a test file that can be opened, yet
@@ -99,6 +141,7 @@ func (f *fileHandler) openAndStat(path string) (http.File, os.FileInfo, error) {
 func acceptable(r *http.Request) []encoding {
 	// list of acceptable encodings, as provided by the client
 	acceptEncodings := make([]encoding, 0, len(supportedEncodings))
+	acceptEncodings = append(acceptEncodings, supportedEncodings[0])
 
 	// the quality of the * encoding; this will be -1 if not sent by client
 	starQuality := -1.
@@ -140,7 +183,7 @@ func acceptable(r *http.Request) []encoding {
 
 	// sort the encoding based on client/server preference
 	sort.Sort(encodingByPreference(acceptEncodings))
-	return acceptEncodings
+	return append(acceptEncodings)
 }
 
 // Find the best file to serve based on the client's Accept-Encoding, and which
@@ -149,14 +192,14 @@ func acceptable(r *http.Request) []encoding {
 func (f *fileHandler) findBestFile(w http.ResponseWriter, r *http.Request, fpath string) (http.File, os.FileInfo, error) {
 	// find the best matching file
 	for _, enc := range acceptable(r) {
-		if file, info, err := f.openAndStat(fpath + enc.extension); err == nil {
+		if file, info, err := openAndStat(f.root, fpath+enc.extension); err == nil {
 			w.Header().Set("Content-Encoding", enc.name)
 			return file, info, nil
 		}
 	}
 
 	// if nothing found, try the base file with no content-encoding
-	return f.openAndStat(fpath)
+	return openAndStat(f.root, fpath)
 }
 
 func (f *fileHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -176,7 +219,75 @@ func (f *fileHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Find the best acceptable file, including trying uncompressed
 	if file, info, err := f.findBestFile(w, r, fpath); err == nil {
 		http.ServeContent(w, r, fpath, info.ModTime(), file)
-		file.Close()
+		_ = file.Close()
+		return
+	}
+
+	// Doesn't exist, compressed or uncompressed
+	http.NotFound(w, r)
+}
+
+// Find the best file to serve based on the client's Accept-Encoding, and which
+// files actually exist on the filesystem. If no file was found that can satisfy
+// the request, the error field will be non-nil.
+func (f *cachingFileHandler) findBestFile(w http.ResponseWriter, r *http.Request, fpath string) (io.ReadSeeker, os.FileInfo, error) {
+	// Check if an acceptable encoding is located in the cache
+	f.lock.RLock()
+	for _, enc := range acceptable(r) {
+		encodingCache := f.cache[enc.name]
+		if entry, exists := encodingCache[fpath]; exists {
+			w.Header().Set("Content-Encoding", enc.name)
+			reader := bytes.NewReader(entry.data)
+			f.lock.RUnlock()
+			return reader, entry.info, nil
+		}
+	}
+
+	// Check the file system and store in the cache
+	for _, enc := range acceptable(r) {
+		if file, info, err := openAndStat(f.root, fpath+enc.extension); err == nil {
+			f.lock.Lock()
+			encodingCache := f.cache[enc.name]
+			data, err := ioutil.ReadAll(file)
+			_ = file.Close()
+			if err != nil {
+				f.lock.Unlock()
+				return nil, nil, err
+			}
+			entry := &cacheEntry{
+				info: info,
+				data: data,
+			}
+			encodingCache[fpath] = entry
+			f.lock.Unlock()
+			if enc.name != "" {
+				w.Header().Set("Content-Encoding", enc.name)
+			}
+			return bytes.NewReader(entry.data), info, nil
+		}
+	}
+
+	return nil, nil, os.ErrNotExist
+
+}
+
+func (f *cachingFileHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	upath := r.URL.Path
+	if !strings.HasPrefix(upath, "/") {
+		upath = "/" + upath
+		r.URL.Path = upath
+	}
+	fpath := path.Clean(upath)
+	if strings.HasSuffix(fpath, "/") {
+		// If you wanted to put back directory browsing support, this is
+		// where you'd do it.
+		http.NotFound(w, r)
+		return
+	}
+
+	// Find the best acceptable file, including trying uncompressed
+	if file, info, err := f.findBestFile(w, r, fpath); err == nil {
+		http.ServeContent(w, r, fpath, info.ModTime(), file)
 		return
 	}
 
