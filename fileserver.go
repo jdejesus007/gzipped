@@ -107,7 +107,7 @@ func FileServer(root http.FileSystem) http.Handler {
 
 // CachingFileServer is a drop-in replacement for FileServer with in-memory
 // caching
-func CachingFileServer(root http.FileSystem) http.Handler {
+func CachingFileServer(root http.FileSystem) *cachingFileHandler {
 	h := &cachingFileHandler{
 		root:  root,
 		cache: make(map[string]map[string]*cacheEntry, 3),
