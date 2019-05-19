@@ -242,6 +242,7 @@ func (f *cachingFileHandler) findBestFile(w http.ResponseWriter, r *http.Request
 			return reader, entry.info, nil
 		}
 	}
+	f.lock.RUnlock()
 
 	// Check the file system and store in the cache
 	for _, enc := range acceptable(r) {
